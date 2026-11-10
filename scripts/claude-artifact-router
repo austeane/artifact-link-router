@@ -1,0 +1,617 @@
+#!/usr/bin/python3
+"""Open claude.ai artifact links in the browser profile signed in to the Claude account that can see them.
+
+macOS. Chromium-family browsers (Chrome, Brave, Edge, Vivaldi, Chromium) are found automatically;
+Safari can be chosen by hand with `set`.
+
+Used three ways:
+  BROWSER=<this file>          Claude Code runs `<this file> <url>` when it opens a link itself
+                               (a click in the fullscreen UI, ctrl+], /artifacts). The session's
+                               current account decides the profile.
+  PostToolUse hook `record`    Remembers artifact id -> account from Artifact tool results, so a
+                               link clicked later (or outside Claude Code) can still be routed.
+  `route <url>`                Called by the Claude Link Router app when it is the default browser.
+                               Uses only the remembered ids; exits 3 when it has nothing to go on.
+
+Commands:
+  status                       each Claude profile, its account, and where its artifacts open
+  detect                       the same, after re-reading the browsers instead of using the cache
+  backfill                     read past Claude Code transcripts to learn who published older artifacts
+  profiles                     every browser profile that can be a target
+  set <email> <target>         pin an account: "Profile 6", "Brave Browser/Default", a profile's
+                               display name, "safari", or "none" to go back to automatic
+  where <url>                  say where a link would open, without opening it
+
+Overrides: ~/.config/claude-artifact-router/profiles.json
+State and log: ~/.local/state/claude-artifact-router/
+CAR_DRY_RUN=1 prints the open command instead of running it.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE = Path(os.environ.get("CAR_STATE_DIR") or HOME / ".local/state/claude-artifact-router")
+CONFIG = Path(os.environ.get("CAR_CONFIG_DIR") or HOME / ".config/claude-artifact-router")
+ARTIFACTS = STATE / "artifacts.tsv"
+DETECTED = STATE / "detected.json"
+ACCOUNTS = STATE / "accounts.json"
+OVERRIDES = CONFIG / "profiles.json"
+LOG = STATE / "router.log"
+ROUTER_APP = HOME / "Applications/Claude Link Router.app"
+
+# App name (as `open -a` takes it) -> profile folder under ~/Library/Application Support.
+# All of these keep a "Local State" profile list and accept --profile-directory.
+SUPPORT = HOME / "Library/Application Support"
+CHROMIUM_BROWSERS = {
+    "Google Chrome": "Google/Chrome",
+    "Brave Browser": "BraveSoftware/Brave-Browser",
+    "Microsoft Edge": "Microsoft Edge",
+    "Vivaldi": "Vivaldi",
+    "Chromium": "Chromium",
+}
+DEFAULT_BROWSER = "Google Chrome"
+
+ARTIFACT_RE = re.compile(r"https?://claude\.ai/(?:code/)?artifact/([A-Za-z0-9_-]{6,80})")
+FOUND_TTL = 24 * 3600
+MISSING_TTL = 10 * 60
+NOT_HANDLED = 3
+
+
+def log(msg):
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        if LOG.exists() and LOG.stat().st_size > 300_000:
+            LOG.write_text("".join(LOG.read_text().splitlines(True)[-500:]))
+        with LOG.open("a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def read_json(path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def artifact_id(url):
+    m = ARTIFACT_RE.match(url or "")
+    return m.group(1) if m else None
+
+
+# ---- Claude accounts -------------------------------------------------------
+
+def account_from_config(config_dir=None):
+    """The account a Claude Code profile is signed in to right now."""
+    if config_dir:
+        candidates = [Path(config_dir) / ".claude.json"]
+    else:
+        candidates = [HOME / ".claude.json", HOME / ".claude/.claude.json"]
+    for f in candidates:
+        o = read_json(f, {}).get("oauthAccount") or {}
+        if o.get("accountUuid"):
+            return {"account": o["accountUuid"], "email": o.get("emailAddress") or "",
+                    "org": o.get("organizationUuid") or "", "org_name": o.get("organizationName") or ""}
+    return None
+
+
+def current_account():
+    return remember(account_from_config(os.environ.get("CLAUDE_CONFIG_DIR")))
+
+
+def remember(acct):
+    """Keep email -> account id, so a record that only has an email can be matched exactly later."""
+    if acct and acct.get("account") and acct.get("email"):
+        known = read_json(ACCOUNTS, {})
+        if known.get(acct["email"].lower(), {}).get("account") != acct["account"]:
+            known[acct["email"].lower()] = {"account": acct["account"], "org": acct.get("org", "")}
+            try:
+                STATE.mkdir(parents=True, exist_ok=True)
+                ACCOUNTS.write_text(json.dumps(known, indent=1))
+            except OSError:
+                pass
+    return acct
+
+
+def with_account_id(acct):
+    """Complete a record that backfill made from an email alone, or from an account id alone."""
+    if acct and not acct.get("account") and acct.get("email"):
+        known = read_json(ACCOUNTS, {}).get(acct["email"].lower())
+        if known:
+            return dict(acct, account=known["account"], org=acct.get("org") or known.get("org", ""))
+    if acct and acct.get("account") and not acct.get("email"):
+        for email, v in read_json(ACCOUNTS, {}).items():
+            if v.get("account") == acct["account"]:
+                return dict(acct, email=email)
+    return acct
+
+
+def remember_signed_in():
+    for _path, cfg in config_dirs():
+        remember(account_from_config(cfg))
+
+
+def account_key(acct):
+    return acct.get("account") or "email:" + acct.get("email", "").lower()
+
+
+def config_dirs():
+    """(label, CLAUDE_CONFIG_DIR value) for the default profile and every ~/.claude-* one."""
+    dirs = [(HOME / ".claude", None)]
+    extra = sorted(p for p in HOME.glob(".claude-*") if (p / ".claude.json").is_file())
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env and Path(env) not in extra and Path(env) != HOME / ".claude":
+        extra.append(Path(env))
+    return dirs + [(p, str(p)) for p in extra]
+
+
+# ---- artifact id -> account records ---------------------------------------
+
+def load_records():
+    recs = {}
+    try:
+        for line in ARTIFACTS.read_text().splitlines():
+            p = line.split("\t")
+            if len(p) >= 3:
+                recs[p[0]] = {"account": p[1], "email": p[2], "org": p[3] if len(p) > 3 else "",
+                              "source": p[5] if len(p) > 5 else ""}
+    except OSError:
+        pass
+    return recs
+
+
+def record_ids(ids, acct, source):
+    if not ids or not acct:
+        return 0
+    recs = load_records()
+    new = [i for i in dict.fromkeys(ids) if i not in recs or account_key(recs[i]) != account_key(acct)]
+    if new:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with ARTIFACTS.open("a") as f:
+            for i in new:
+                f.write("\t".join([i, acct.get("account", ""), acct["email"], acct.get("org", ""),
+                                   str(int(time.time())), source]) + "\n")
+    return len(new)
+
+
+def cmd_record():
+    """PostToolUse hook: remember every artifact link in the tool result. Never fails the tool."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        # Only the result: a link that appears only in the input may be one this account cannot open.
+        text = json.dumps(payload.get("tool_response", "")).replace("\\/", "/")
+        ids = [m.group(1) for m in ARTIFACT_RE.finditer(text)]
+        n = record_ids(ids, current_account(), payload.get("tool_name") or "hook")
+        if n:
+            log(f"record {n} artifact(s) from {payload.get('tool_name')}")
+    except Exception as e:  # noqa: BLE001 - a hook must not break the session
+        log(f"record failed: {e!r}")
+    return 0
+
+
+# ---- account -> browser profile -------------------------------------------
+# A target is "safari" or "<App name>/<profile folder>", e.g. "Google Chrome/Profile 6".
+
+def browser_profiles():
+    out = {}
+    for app, rel in CHROMIUM_BROWSERS.items():
+        info = None
+        for attempt in (1, 2):  # the browser rewrites this file often; one retry rides out a bad read
+            try:
+                info = json.loads((SUPPORT / rel / "Local State").read_text()).get("profile", {}).get("info_cache", {})
+                break
+            except FileNotFoundError:
+                break
+            except (OSError, ValueError) as e:
+                if attempt == 2:
+                    log(f"cannot read {app} profile list: {e!r}")
+                else:
+                    time.sleep(0.1)
+        if not info:
+            continue
+        for folder, v in info.items():
+            out[f"{app}/{folder}"] = {"app": app, "folder": folder, "dir": SUPPORT / rel / folder,
+                                      "name": v.get("name") or "", "user": (v.get("user_name") or "").lower()}
+    return out
+
+
+def scan_browsers(account_uuid):
+    """Count how often each browser profile's site storage mentions this Claude account id.
+
+    claude.ai keeps the signed-in account id in localStorage, so the profile that is signed in
+    to the account has it on disk; the others do not.
+    """
+    needles = [account_uuid.encode(), account_uuid.encode("utf-16-le")]
+    hits = {}
+    for key, prof in browser_profiles().items():
+        n = 0
+        try:
+            for f in (prof["dir"] / "Local Storage/leveldb").iterdir():
+                if f.suffix in (".ldb", ".log"):
+                    data = f.read_bytes()
+                    n += sum(data.count(x) for x in needles)
+        except OSError:
+            continue
+        if n:
+            hits[key] = n
+    return hits
+
+
+def normalize_target(value):
+    """Accept safari, "App/Folder", a bare folder (meaning Chrome), a display name or a Google email."""
+    if not value or value.lower() == "none":
+        return None
+    if value.lower() == "safari":
+        return "safari"
+    profs = browser_profiles()
+    for candidate in (value, f"{DEFAULT_BROWSER}/{value}"):
+        if candidate in profs:
+            return candidate
+    low = value.lower()
+    named = [k for k, v in profs.items() if low in (v["name"].lower(), v["user"], f"{v['app']}/{v['name']}".lower())]
+    return named[0] if len(named) == 1 else None
+
+
+def canonical(target):
+    """Spell a stored target the current way; older state holds a bare Chrome folder name."""
+    if not target or target == "safari" or "/" in target:
+        return target or None
+    return f"{DEFAULT_BROWSER}/{target}"
+
+
+def detect(acct, force=False):
+    cache = read_json(DETECTED, {})
+    ent = cache.get(account_key(acct))
+    if ent and not force:
+        age = time.time() - ent.get("at", 0)
+        if age < (FOUND_TTL if ent.get("target") else MISSING_TTL):
+            return ent
+    hits = scan_browsers(acct["account"]) if acct.get("account") else {}
+    target, why = None, "no browser profile has this account's claude.ai session"
+    if hits:
+        target = max(hits, key=hits.get)
+        others = sorted(set(hits) - {target})
+        why = "claude.ai session found" + (f" (also in {', '.join(others)})" if others else "")
+    else:
+        same = [k for k, v in browser_profiles().items() if v["user"] and v["user"] == acct["email"].lower()]
+        if len(same) == 1:
+            target, why = same[0], "browser profile's Google account has the same email"
+    ent = {"target": target, "why": why, "email": acct["email"], "at": int(time.time())}
+    cache[account_key(acct)] = ent
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        DETECTED.write_text(json.dumps(cache, indent=1))
+    except OSError:
+        pass
+    return ent
+
+
+def target_for(acct, force=False):
+    """-> (target or None, reason)"""
+    acct = with_account_id(acct)
+    ov = read_json(OVERRIDES, {})
+    for key in (acct.get("account"), acct["email"], acct["email"].lower()):
+        if key and key in ov:
+            t = normalize_target(str(ov[key])) or canonical(str(ov[key]))
+            return t, "set in profiles.json"
+    ent = detect(acct, force)
+    return canonical(ent.get("target")), ent.get("why", "")
+
+
+# ---- opening ---------------------------------------------------------------
+
+def run(cmd):
+    if os.environ.get("CAR_DRY_RUN"):
+        print(" ".join(repr(c) if " " in c else c for c in cmd))
+        return 0
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+
+
+def open_in(target, url):
+    if target == "safari":
+        return run(["/usr/bin/open", "-a", "Safari", url])
+    app, _, folder = target.partition("/")
+    # -n starts a second browser process that hands the URL to the running one and exits;
+    # without it macOS ignores --args when the browser is already open.
+    return run(["/usr/bin/open", "-na", app, "--args", f"--profile-directory={folder}", url])
+
+
+def choose(url, use_session):
+    """-> (target or None, account or None, reason)"""
+    aid = artifact_id(url)
+    if not aid:
+        return None, None, "not an artifact link"
+    rec = load_records().get(aid)
+    acct = with_account_id(rec) or (current_account() if use_session else None)
+    if not acct:
+        return None, None, "no record of which account published it"
+    target, why = target_for(acct)
+    return target, acct, ("recorded owner; " if rec else "session account; ") + why
+
+
+def cmd_open(url):
+    """BROWSER mode: called by Claude Code with the session's environment."""
+    target, acct, why = choose(url, use_session=True)
+    if target:
+        log(f"open {artifact_id(url)[:8]} {acct['email']} -> {target} ({why})")
+        if open_in(target, url) == 0:
+            return 0
+    elif acct:
+        log(f"open {artifact_id(url)[:8]} {acct['email']} -> default browser ({why})")
+    return run(["/usr/bin/open", url])
+
+
+def cmd_route(url):
+    """Default-browser mode: handled (0) or not (3, the app then opens the link normally)."""
+    target, acct, why = choose(url, use_session=False)
+    if not target:
+        if artifact_id(url):
+            log(f"route {artifact_id(url)[:8]} -> not routed ({why})")
+        return NOT_HANDLED
+    log(f"route {artifact_id(url)[:8]} {acct['email']} -> {target} ({why})")
+    return 0 if open_in(target, url) == 0 else NOT_HANDLED
+
+
+# ---- backfill from past transcripts ---------------------------------------
+
+EMAIL_RE = re.compile(rb"user's email address is ([^\s\"\\]+@[^\s\"\\]+?)\. ")
+ARTIFACT_TOOL_RE = re.compile(r"^(Artifact|ArtifactComments|ArtifactData|mcp__claude_ai_Claude_Docs__.*)$")
+ARTIFACT_MARKS = (b"claude.ai/artifact/", b"claude.ai/code/artifact/")
+
+
+def transcript_roots():
+    roots = {}
+    for path, _cfg in config_dirs():
+        p = Path(path) / "projects"
+        if p.is_dir():
+            roots[os.path.realpath(p)] = True
+    return list(roots)
+
+
+def transcripts_mentioning_artifacts(roots):
+    """Transcript files that contain an artifact link. ripgrep if present, else a slow plain read."""
+    if not roots:  # with no path, rg would search the current directory
+        return []
+    rg = shutil.which("rg") or next((c for c in ("/opt/homebrew/bin/rg", "/usr/local/bin/rg") if os.path.exists(c)), None)
+    if rg:
+        cmd = [rg, "-l", "-F", "--no-messages", "--glob", "*.jsonl", "-e", "claude.ai/artifact/", "-e", "claude.ai/code/artifact/"]
+        out = subprocess.run(cmd + roots, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
+        return [f for f in out.decode(errors="replace").splitlines() if f]
+    print("ripgrep (rg) not found; reading every transcript, which is slow on large histories")
+    found = []
+    for root in roots:
+        for d, _dirs, files in os.walk(root):
+            for name in files:
+                if name.endswith(".jsonl"):
+                    f = os.path.join(d, name)
+                    try:
+                        with open(f, "rb") as fh:
+                            if any(any(m in line for m in ARTIFACT_MARKS) for line in fh):
+                                found.append(f)
+                    except OSError:
+                        pass
+    return found
+
+
+def scan_transcript(path, pairs):
+    """-> [(artifact id, account id or "", email or "", timestamp)] for this session's artifacts.
+
+    Two kinds of evidence count: the "frame-link" line Claude Code writes for a session's own
+    artifacts, and the result of an Artifact (or Claude Docs) tool call. A link that merely appears
+    in a prompt or in some command's output is ignored, because the session's account may not be
+    able to open it.
+
+    Who the session was at that moment comes from the nearest earlier "session-owner" line, which
+    carries the exact account id; a long session can change accounts many times. Transcripts from
+    before Claude Code wrote those lines fall back to the nearest "user's email address" line. That
+    line lags a sign-in change by a few turns, so it is the weaker signal, but counting which email
+    appears under which account id (`pairs`) still tells us each account's email.
+    """
+    owner, email, found, tool_ids = "", "", [], set()
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return found
+    with fh:
+        for line in fh:
+            if line.startswith(b'{"type":"session-owner"'):
+                try:
+                    owner = json.loads(line).get("accountUuid") or owner
+                except ValueError:
+                    pass
+                continue
+            if b"email address is" in line:
+                m = None
+                for m in EMAIL_RE.finditer(line):
+                    pass
+                if m:
+                    email = m.group(1).decode(errors="replace").lower()
+                    if owner:
+                        pairs[(owner, email)] = pairs.get((owner, email), 0) + 1
+            has_link = any(m in line for m in ARTIFACT_MARKS)
+            if not has_link and b'"name":"Artifact' not in line and b'"name":"mcp__claude_ai_Claude_Docs__' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            ids, kind = [], o.get("type")
+            if kind == "frame-link":
+                ids = [artifact_id(o.get("frameUrl") or "")]
+            else:
+                content = (o.get("message") or {}).get("content")
+                for part in content if isinstance(content, list) else []:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "tool_use" and ARTIFACT_TOOL_RE.match(part.get("name") or ""):
+                        tool_ids.add(part.get("id"))
+                    elif part.get("type") == "tool_result" and part.get("tool_use_id") in tool_ids and not part.get("is_error"):
+                        text = json.dumps(part.get("content", "")).replace("\\/", "/")
+                        ids += [m.group(1) for m in ARTIFACT_RE.finditer(text)]
+            ts = o.get("timestamp") or ""
+            found += [(i, owner, "" if owner else email, ts) for i in ids if i and (owner or email)]
+    return found
+
+
+def emails_by_account(pairs):
+    """account id -> its email: the email seen most often while that account owned a session."""
+    known = {v["account"]: e for e, v in read_json(ACCOUNTS, {}).items()}
+    totals, best = {}, {}
+    for (owner, email), n in pairs.items():
+        totals[owner] = totals.get(owner, 0) + n
+        if n > best.get(owner, ("", 0))[1]:
+            best[owner] = (email, n)
+    for owner, (email, n) in best.items():
+        if owner not in known and n >= 3 and n * 10 >= totals[owner] * 6:
+            known[owner] = email
+            remember({"account": owner, "email": email})
+    return known
+
+
+def cmd_backfill():
+    remember_signed_in()
+    roots = transcript_roots()
+    files = transcripts_mentioning_artifacts(roots)
+    print(f"{len(files)} transcript(s) mention artifact links; reading them")
+    first, pairs = {}, {}  # artifact id -> earliest evidence, which is the publish
+    for n, f in enumerate(files, 1):
+        for i, owner, email, ts in scan_transcript(f, pairs):
+            if i not in first or (ts and ts < first[i][0]):
+                first[i] = (ts, owner, email)
+        if n % 1000 == 0:
+            print(f"  {n}/{len(files)}")
+    emails = emails_by_account(pairs)
+    recs = load_records()
+    groups, kept = {}, 0
+    for i, (_ts, owner, email) in first.items():
+        acct = with_account_id({"account": owner, "email": emails.get(owner, "") if owner else email, "org": ""})
+        if not acct["email"] and not acct["account"]:
+            continue
+        old = recs.get(i)
+        # What the live hook recorded is firmer than a reading of old transcripts; an earlier
+        # backfill's answer is replaced when this one differs.
+        if old and (old.get("source") != "backfill" or account_key(old) == account_key(acct)):
+            kept += 1
+            continue
+        groups.setdefault(account_key(acct), (acct, []))[1].append(i)
+    added = sum(len(ids) for _a, ids in groups.values())
+    for _key, (acct, ids) in sorted(groups.items(), key=lambda kv: kv[1][0]["email"]):
+        record_ids(ids, acct, "backfill")
+        target, why = target_for(acct)
+        print(f"  {acct['email'] or acct['account']}: {len(ids)} artifact(s) -> {describe(target)}  [{why}]")
+    print(f"Recorded {added} artifact(s); {kept} already had the same or a firmer record.")
+    log(f"backfill recorded {added} from {len(files)} transcripts")
+    return 0
+
+
+# ---- inspection ------------------------------------------------------------
+
+def describe(target):
+    if not target:
+        return "(none: opens in the default browser)"
+    if target == "safari":
+        return "Safari"
+    p = browser_profiles().get(target, {})
+    return f"{target} \"{p.get('name', '?')}\" {p.get('user', '')}".rstrip()
+
+
+def cmd_status(force=False):
+    print("Claude profile -> signed-in account -> browser profile for its artifacts")
+    remember_signed_in()
+    seen = {}
+    for path, cfg in config_dirs():
+        acct = account_from_config(cfg)
+        if not acct:
+            print(f"  {path}: not signed in")
+            continue
+        seen[acct["account"]] = acct
+        seen["email:" + acct["email"].lower()] = acct
+        target, why = target_for(acct, force)
+        print(f"  {path}: {acct['email']} ({acct['org_name']})\n      -> {describe(target)}  [{why}]")
+    recs = load_records()
+    others = {account_key(r): r for r in map(with_account_id, recs.values()) if account_key(r) not in seen}
+    if others:
+        print("Accounts with recorded artifacts that no profile is signed in to right now")
+        for r in others.values():
+            target, why = target_for(r, force)
+            n = sum(1 for x in map(with_account_id, recs.values()) if account_key(x) == account_key(r))
+            print(f"  {r['email'] or r['account']} ({n} artifacts)\n      -> {describe(target)}  [{why}]")
+    print(f"Recorded artifacts: {len(recs)}")
+    print(f"Overrides: {OVERRIDES} ({len(read_json(OVERRIDES, {}))} set)")
+    print(f"Link router app installed: {'yes' if ROUTER_APP.exists() else 'no'}")
+    return 0
+
+
+def cmd_profiles():
+    for key, v in sorted(browser_profiles().items()):
+        print(f"  {key}  \"{v['name']}\"  {v['user']}")
+    print("  safari")
+    return 0
+
+
+def cmd_set(key, value):
+    target = normalize_target(value)
+    if value.lower() != "none" and not target:
+        print(f"Unknown or ambiguous profile {value!r}. Targets:")
+        cmd_profiles()
+        return 2
+    ov = read_json(OVERRIDES, {})
+    if target:
+        ov[key] = target
+    else:
+        ov.pop(key, None)
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    OVERRIDES.write_text(json.dumps(ov, indent=1) + "\n")
+    print(f"{key} -> {describe(target) if target else 'automatic'}")
+    return 0
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if re.match(r"^[a-z][a-z0-9+.-]*:", cmd):  # BROWSER=<this file> passes just the URL
+        return cmd_open(cmd)
+    if cmd == "open" and rest:
+        return cmd_open(rest[0])
+    if cmd == "route" and rest:
+        return cmd_route(rest[0])
+    if cmd == "record":
+        return cmd_record()
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "detect":
+        return cmd_status(force=True)
+    if cmd == "profiles":
+        return cmd_profiles()
+    if cmd == "backfill":
+        return cmd_backfill()
+    if cmd == "set" and len(rest) == 2:
+        return cmd_set(rest[0], rest[1])
+    if cmd == "where" and rest:
+        target, acct, why = choose(rest[0], use_session=True)
+        print(f"{describe(target)}  [{(acct or {}).get('email', '-')}; {why}]")
+        return 0
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Exception as e:  # noqa: BLE001 - never leave a click with nothing opening
+        log(f"error: {e!r}")
+        if len(sys.argv) > 1 and sys.argv[1] == "route":
+            sys.exit(NOT_HANDLED)
+        url = next((a for a in sys.argv[1:] if a.startswith("http")), None)
+        if url and sys.argv[1] in ("open", url):
+            sys.exit(subprocess.run(["/usr/bin/open", url]).returncode)
+        raise
